@@ -699,14 +699,12 @@ def main(conf):
         warmup_steps=int(conf.get("warmup_steps", 0)),
         save_every=int(conf.get("save_every", 50))
     )
-    # wandb.login(key="29dcdd0e7422a0225de2cb0c5e9dbd04ff6605f0")
 
     # Init wandb
     wandb.init(project=dc_conf.project_name, name=dc_conf.run_name, 
                config=OmegaConf.to_container(conf),
                mode="online"
         )
-            #    settings=wandb.Settings(_disable_stats=True))
 
     # Initialize ES components
     es_conf = ESConfig()
