@@ -1,12 +1,12 @@
-# Evolving Connectivity for Recurrent Spiking Neural Networks Repository
+# Distributional Crossover for Recurrent Spiking Neural Networks Repository
 
-This repository contains the implementation of the paper [Evolving Connectivity for Recurrent Spiking Neural Networks](https://arxiv.org/abs/2305.17650). It includes the Evolutionary Connectivity (EC) algorithm, Recurrent Spiking Neural Networks (RSNN), and the Evolution Strategies (ES) baseline implemented in JAX.
+This repository contains the implementation of the Distributional Crossover evolutional strategies. It includes the Evolutionary Connectivity (EC) algorithm, Recurrent Spiking Neural Networks (RSNN), and the Evolution Strategies (ES) baseline and Distributional Crossover (DC) baseline implemented in JAX.
 
 ## Getting Started
 
 ### Prerequisites
 
-1. [Install JAX](https://github.com/google/jax#installation)
+1. [Install JAX](https://github.com/google/jax#installation). **Note**: Jax version of 0.4.19 is proper for DC to run. Please check the CUDA and CUDNN version when installing jax.
 
 2. [Install W&B](https://github.com/wandb/wandb) and log in to your account to view metrics
 
@@ -15,6 +15,10 @@ This repository contains the implementation of the paper [Evolving Connectivity 
 ```bash
 pip install -r requirements.txt
 ```
+or
+```bash
+conda env create --prefix/-n your_preifx/env_name --file freeze.yml
+```
 
 ### Precautions
 
@@ -22,6 +26,12 @@ pip install -r requirements.txt
 - Due to the inherent numerical stochasticity in Brax's physics simulations, variations in results can occur even when using a fixed seed.
 
 ## Usage
+
+### Training DC with RSNN
+```
+scripts/run_dc_vectorized.sh
+```
+You can change the params in 'run_dc_vectorized.sh'. Wandb args like run-names can be changed in the 'dc_vectorized_release.py'.
 
 ### Training EC with RSNN
 
