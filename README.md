@@ -24,7 +24,7 @@ conda env create --prefix/-n your_preifx/env_name --file freeze.yml
 - Due to the inherent numerical stochasticity in Brax's physics simulations, variations in results can occur even when using a fixed seed.
 
 ## Usage
-    dc-toy-simplified.py contains codes for evaluating in both real RL environment and toy-task environment. 
+dc-toy-simplified.py contains codes for evaluating in both real RL environment and toy-task environment. 
 
 ### Training DC with RSNN
 ```
