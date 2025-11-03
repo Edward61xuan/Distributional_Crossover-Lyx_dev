@@ -1,7 +1,8 @@
-from hmac import new
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # disable GPU for Brax
+from hmac import new
 # os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"  # or set to your custom W&B server
-# os.environ["WANDB_MODE"] = "disabled"  # "offline" for offline logging
+os.environ["WANDB_MODE"] = "disabled"  # "offline" for offline logging
 from functools import partial
 import stat
 from turtle import update
@@ -45,7 +46,7 @@ class ESConfig:
     env_cls:     Any = None
 
     # [Hyperparameters] ES
-    pop_size:       int = 10240
+    pop_size:       int = 2560
     lr:           float = 0.15
 
     eps:          float = 1e-3
@@ -63,10 +64,11 @@ class ESConfig:
 
     p_dtype:       Any  = jnp.float32
     network_dtype: Any  = jnp.float32
-    num_runners : int = 2
+    num_runners : int = 4
 
     #[Crossover & Selection]
-    crossover_ratio: float = 1 # num_offsprings = crossover_ratio * num_parents
+    crossover_ratio: float = 2 # num_offsprings = crossover_ratio * num_parents
+    crossover_method : str = "random-pick" # "arithmetic" or "random-pick"
 
 @flax.struct.dataclass
 class OneRunnerState:
@@ -247,10 +249,20 @@ def _runners_init(master_key:Any, network_init_key:Any, conf:ESConfig):
     normalizer = running_statistics.init_state(specs.Array((conf.env_cls.observation_size,), jnp.float32))
     return RunnersState(key=master_key, runners=runners_batched, normalizer_state=normalizer)
 
-@partial(jax.jit, static_argnums=(1,2))
-def _one_runner_run(runner: OneRunnerState, conf: ESConfig, toy : bool = False) -> Tuple[OneRunnerState, Dict, jnp.ndarray]:
+@partial(jax.jit, static_argnums=(1,2,3))
+def _one_runner_run(runner: OneRunnerState, conf: ESConfig, 
+                    toy : bool = False, 
+                    do_update : bool = False) -> Tuple[OneRunnerState, Dict, jnp.ndarray]:
     """
     Run the ES/eval step for a single OneRunnerState.
+
+    Args:
+        runner: OneRunnerState
+        conf: ESConfig
+        toy: bool, whether to use toy evaluation step
+        do_update: bool, whether to perform parameter(rhos) update,
+            if True, perform standard ES update,
+            if False, only evaluate current params without update (for crossover evaluation).
 
     Returns:
         new_runner: OneRunnerState (params/opt_state/fitness updated; NORMALIZER NOT UPDATED)
@@ -264,16 +276,19 @@ def _one_runner_run(runner: OneRunnerState, conf: ESConfig, toy : bool = False) 
     runner = runner.replace(key=new_key)
 
     # ---- sample train & eval parameters from bernoulli p (runner.params) ----
+
+    
     train_params = _sample_bernoulli_parameter(run_key, runner.params, conf.network_dtype,
-                                               (conf.pop_size - conf.eval_size,))
+                                            (conf.pop_size - conf.eval_size,))
     eval_params = _deterministic_bernoulli_parameter(runner.params, (conf.eval_size,))
     # concat into network_params of shape (pop_size, ...)
     network_params = jax.tree_map(lambda train, eval: jnp.concatenate([train, eval], axis=0),
-                                  train_params, eval_params)
+                                train_params, eval_params)
+    split_idx = conf.pop_size - conf.eval_size
 
     # helper to split fitness arrays into [train, eval]
     def _split_fitness(x):
-        return jnp.split(x, [conf.pop_size - conf.eval_size, ])
+        return jnp.split(x, [split_idx, ])
 
     # ---- initialize PopulationState (for this runner only) ----
     pop = PopulationState(
@@ -331,34 +346,47 @@ def _one_runner_run(runner: OneRunnerState, conf: ESConfig, toy : bool = False) 
         metrics.update(conf.network_cls.carry_metrics(pop.network_states))
 
     # ---- compute fitness arrays ----
-    fitness, eval_fitness = _split_fitness(pop.fitness_sum / pop.fitness_n)
-
-    # ---- compute NES gradient using centered ranks (same as original) ----
-    weight = _centered_rank_transform(fitness)
-
-    def _nes_grad(p, theta):
-        w = weight.reshape((-1,) + (1,) * (theta.ndim - 1)).astype(p.dtype)
-        return -jnp.mean(w * (theta - p), axis=0)
-
-    grads = jax.tree_map(
-        lambda p, theta: _nes_grad(p, theta[:(conf.pop_size - conf.eval_size)]),
-        runner.params, pop.network_params
-    )
-
-    # ---- optimizer update (optax style) ----
-    updates, new_opt_state = conf.optim_cls.update(grads, runner.opt_state, runner.params)
-    new_params = optax.apply_updates(runner.params, updates)
-
-    # ---- clip params to bernoulli valid range ----
-    new_params = jax.tree_map(lambda p: jnp.clip(p, conf.eps, 1 - conf.eps), new_params)
-
+    fitness_all = pop.fitness_sum / pop.fitness_n
+    fitness, eval_fitness = _split_fitness(fitness_all)
     mean_fitness = jnp.mean(fitness)
     mean_eval_fitness = jnp.mean(eval_fitness)
+
+    # expose per-sample fitness distributions for distributional logging
+    metrics.update({
+        "sample_fitness_distribution": fitness,
+        "sample_eval_fitness_distribution": eval_fitness,
+    })
+
+    if do_update :
+    # FIXME: Maybe it's not good to adopt opt_state from parents???
+    # ---- compute NES gradient using centered ranks (same as original) ----
+        weight = _centered_rank_transform(fitness)
+
+        def _nes_grad(p, theta):
+            w = weight.reshape((-1,) + (1,) * (theta.ndim - 1)).astype(p.dtype)
+            return -jnp.mean(w * (theta - p), axis=0)
+
+        grads = jax.tree_map(
+            lambda p, theta: _nes_grad(p, theta[:(conf.pop_size - conf.eval_size)]),
+            runner.params, pop.network_params
+        )
+
+        # ---- optimizer update (optax style) ----
+        updates, new_opt_state = conf.optim_cls.update(grads, runner.opt_state, runner.params)
+        new_params = optax.apply_updates(runner.params, updates)
+
+        # ---- clip params to bernoulli valid range ----
+        new_params = jax.tree_map(lambda p: jnp.clip(p, conf.eps, 1 - conf.eps), new_params)
+    
+    else:
+        new_params = runner.params
+        new_opt_state = runner.opt_state
+        
 
     runner = runner.replace(
         params=new_params,
         opt_state=new_opt_state,
-        fitness=mean_fitness
+        fitness = mean_fitness
     )
 
     def _flatten_params_to_vec(p):
@@ -379,7 +407,7 @@ def _one_runner_run(runner: OneRunnerState, conf: ESConfig, toy : bool = False) 
     metrics.update({
         "fitness": mean_fitness,
         "eval_fitness": mean_eval_fitness,
-        "sparsity": mean_weight_abs(new_params),
+        "sparsity": mean_weight_abs(runner.params),
 
         "p_target_mean": jnp.mean(p_t),
         "p_other_mean": jnp.mean(p_o),
@@ -392,8 +420,11 @@ def _one_runner_run(runner: OneRunnerState, conf: ESConfig, toy : bool = False) 
     # metrics (dict) and obs_for_normalizer (pop_size, obs_dim)
     return runner, metrics, obs_for_normalizer
 
-@partial(jax.jit, static_argnums=(1,2))
-def _runners_run(runners_state: RunnersState, conf: ESConfig, update_normalizer : bool = True, toy : bool = True) -> Tuple[RunnersState, Dict]:
+@partial(jax.jit, static_argnums=(1,2,3,4))
+def _runners_run(runners_state: RunnersState, conf: ESConfig, 
+                 update_normalizer : bool = True, 
+                 toy : bool = True,
+                 do_update : bool = True) -> Tuple[RunnersState, Dict]:
     """
     Run all runners in parallel:
       - split master key -> per-runner keys
@@ -419,7 +450,7 @@ def _runners_run(runners_state: RunnersState, conf: ESConfig, update_normalizer 
     #    _one_runner_run returns (runner, metrics, obs_for_normalizer) for each runner,
     #    so vmap returns triples with leading axis = num_runners.
     updated_runners_batched, metrics_batched, obs_batched = jax.vmap(
-        _one_runner_run, in_axes=(0, None, None))(runners_with_keys, conf, toy)
+        _one_runner_run, in_axes=(0, None, None, None))(runners_with_keys, conf, toy, do_update)
 
     # 4) aggregate obs_for_normalizer across runners -> shape (num_runners * pop_size, obs_dim)
     #    obs_batched shape usually (num_runners, pop_size, obs_dim)
@@ -460,6 +491,24 @@ def _runners_run(runners_state: RunnersState, conf: ESConfig, update_normalizer 
 
     aggregated_metrics = jax.tree_util.tree_map(_mean_metric, metrics_batched)
 
+    # also include flattened sample distributions and runners' fitness distribution
+    # metrics_batched contains arrays with leading axis = num_runners
+    # flatten sample distributions into 1-D arrays for logging
+    try:
+        sample_fitness_distribution = metrics_batched["sample_fitness_distribution"].reshape(-1)
+        sample_eval_fitness_distribution = metrics_batched["sample_eval_fitness_distribution"].reshape(-1)
+    except Exception:
+        # if these keys are not present, set empty arrays
+        sample_fitness_distribution = jnp.array([], dtype=jnp.float32)
+        sample_eval_fitness_distribution = jnp.array([], dtype=jnp.float32)
+
+    runners_fitness_distribution = updated_runners_batched.fitness.reshape(-1)
+
+    aggregated_metrics = dict(aggregated_metrics)
+    aggregated_metrics["sample_fitness_distribution"] = sample_fitness_distribution
+    aggregated_metrics["sample_eval_fitness_distribution"] = sample_eval_fitness_distribution
+    aggregated_metrics["runners_fitness_distribution"] = runners_fitness_distribution
+
     return new_runners_state, aggregated_metrics
 
 def arithmetic_crossover(parent1, parent2, key):
@@ -467,11 +516,82 @@ def arithmetic_crossover(parent1, parent2, key):
     alpha = jax.random.uniform(key, shape=())
     return jax.tree_map(lambda p1, p2: alpha * p1 + (1 - alpha) * p2, parent1, parent2)
 
+def random_pick_crossover(parent1, parent2, key):
+    """Random pick crossover: randomly select genes from either parent."""
+    def _crossover_gene(gene1, gene2, k):
+        mask = jax.random.bernoulli(k, 0.5, gene1.shape)
+        return jnp.where(mask, gene1, gene2)
+
+    # Ensure the per-leaf keys form a pytree matching parent1/parent2 structure.
+    treedef = jax.tree_util.tree_structure(parent1)
+    num_leaves = len(jax.tree_util.tree_leaves(parent1))
+    keys = jax.random.split(key, num_leaves)
+    keys_tree = jax.tree_util.tree_unflatten(treedef, list(keys))
+    return jax.tree_map(_crossover_gene, parent1, parent2, keys_tree)
+
+def logit_space_crossover(parent1, parent2, key):
+    """Crossover in logit space: preserves high-confidence bits."""
+    def _logit(p):  # avoid 0/1 overflow
+        p = jnp.clip(p, 1e-6, 1 - 1e-6)
+        return jnp.log(p / (1 - p))
+
+    def _sigmoid(x): return 1 / (1 + jnp.exp(-x))
+
+    alpha = jax.random.uniform(key, shape=())
+    return jax.tree_map(lambda p1, p2: _sigmoid(alpha * _logit(p1) + (1 - alpha) * _logit(p2)),
+                        parent1, parent2)
+
+def sample_based_crossover(parent1, parent2, key, sample_size=32):
+    """Sample offspring bitstrings from parents, recombine, and re-estimate p."""
+    # parent1/parent2 are pytrees (dicts / nested structures). We must
+    # operate on each leaf separately. For reproducibility we split the
+    # RNG into per-leaf keys (3 keys per leaf: for s1, s2, mask).
+    treedef = jax.tree_util.tree_structure(parent1)
+    leaves1 = jax.tree_util.tree_leaves(parent1)
+    leaves2 = jax.tree_util.tree_leaves(parent2)
+
+    num_leaves = len(leaves1)
+    if num_leaves == 0:
+        return parent1
+
+    # split into 3 * num_leaves keys
+    keys = jax.random.split(key, 3 * num_leaves)
+    k1s = keys[:num_leaves]
+    k2s = keys[num_leaves:2 * num_leaves]
+    kms = keys[2 * num_leaves:]
+
+    new_leaves = []
+    for i, (l1, l2) in enumerate(zip(leaves1, leaves2)):
+        k1 = k1s[i]
+        k2 = k2s[i]
+        km = kms[i]
+
+        # sample bits from Bernoulli(p) for each parent leaf
+        s1 = jax.random.bernoulli(k1, l1, (sample_size,) + l1.shape).astype(jnp.float32)
+        s2 = jax.random.bernoulli(k2, l2, (sample_size,) + l2.shape).astype(jnp.float32)
+
+        # random mask to pick bits from s1 or s2
+        mask = jax.random.bernoulli(km, 0.5, s1.shape)
+        children = jnp.where(mask, s1, s2)
+
+        # re-estimate p by averaging over samples (axis 0)
+        new_p_leaf = jnp.mean(children, axis=0)
+        new_leaves.append(new_p_leaf)
+
+    new_p = jax.tree_util.tree_unflatten(treedef, new_leaves)
+    return new_p
+
 
 def crossover_operator(parent1, parent2, key, method="arithmetic"):
     """Select crossover operator based on method."""
     if method == "arithmetic":
         return arithmetic_crossover(parent1, parent2, key)
+    elif method == "random-pick":
+        return random_pick_crossover(parent1, parent2, key)
+    elif method == "logit-space":
+        return logit_space_crossover(parent1, parent2, key)
+    elif method == "sample-based":
+        return sample_based_crossover(parent1, parent2, key)
     else:
         raise ValueError(f"Unknown crossover method: {method}")
 
@@ -509,7 +629,34 @@ def _generate_offspring(runners: RunnersState, conf: ESConfig, master_key: Any):
         return crossover_operator(p1, p2, k, method=getattr(conf, "crossover_method", "arithmetic"))
     
     offspring_params = jax.vmap(_generate_single_child, in_axes=(0,0))(parent_idx, alpha_keys)
-    return offspring_params, new_master_key
+    # --- add small gaussian noise to offspring parameters to help escape local optima ---
+    # offspring_params is a pytree where each leaf has leading axis = num_offspring
+    # We'll generate one RNG key per leaf and sample noise with shape equal to the leaf.
+    sigma = getattr(conf, "crossover_noise_std", 0.01)
+
+    treedef = jax.tree_util.tree_structure(offspring_params)
+    leaves = jax.tree_util.tree_leaves(offspring_params)
+    num_leaves = len(leaves)
+
+    if num_leaves > 0:
+        # consume new_master_key to produce per-leaf keys and a new master key to return
+        nkeys = jax.random.split(new_master_key, num_leaves + 1)
+        new_master_key_final = nkeys[0]
+        leaf_keys = nkeys[1:]
+
+        new_leaves = []
+        for lk, leaf in zip(leaf_keys, leaves):
+            # leaf has shape (num_offspring, ...)
+            noise = jax.random.normal(lk, shape=leaf.shape) * sigma
+            # add noise and clip to valid bernoulli probability range
+            new_leaf = jnp.clip(leaf + noise, conf.eps, 1.0 - conf.eps)
+            new_leaves.append(new_leaf)
+
+        offspring_params = jax.tree_util.tree_unflatten(treedef, new_leaves)
+    else:
+        new_master_key_final = new_master_key
+
+    return offspring_params, new_master_key_final, parent_idx
 
 @partial(jax.jit, static_argnums=(1,)) #FIXME: maybe arg 0 could be donated
 def _runners_crossover_selection(runners: RunnersState, conf: ESConfig) -> Tuple[RunnersState, Dict]:
@@ -522,10 +669,18 @@ def _runners_crossover_selection(runners: RunnersState, conf: ESConfig) -> Tuple
    
 
     # 1) Generate offspring params:
-    offspring_params, new_master_key = _generate_offspring(runners, conf, runners.key)
+    offspring_params, new_master_key, parent_idx = _generate_offspring(runners, conf, runners.key)
 
     # 2) Clone runner templates
-    offspring_template = jax.tree_map(lambda x: x[:num_offspring], runners.runners)
+    # offspring_template = jax.tree_map(lambda x: x[:num_offspring], runners.runners)
+    template_parent_idx = parent_idx[:, 0]
+
+    def _gather_from_parents(x):
+        if hasattr(x, "ndim") and x.ndim > 0:
+            return jnp.take(x, template_parent_idx, axis=0)
+        return x
+
+    offspring_template = jax.tree_map(_gather_from_parents, runners.runners)
     offspring_runners = offspring_template.replace(
         params = offspring_params,
         fitness = jnp.zeros(num_offspring, dtype=jnp.float32),
@@ -542,8 +697,10 @@ def _runners_crossover_selection(runners: RunnersState, conf: ESConfig) -> Tuple
         normalizer_state=runners.normalizer_state  # share parent's normalizer (or copy)
     )
 
+    offspring_conf = conf.replace(num_runners=num_offspring)
+
     # 3) Evaluate offspring runners
-    evaluated_offspring_state, offspring_metrics = _runners_run(offspring_state, conf, update_normalizer=False)
+    evaluated_offspring_state, offspring_metrics = _runners_run(offspring_state, offspring_conf, update_normalizer=True, toy=True, do_update=False)
     evaluated_offspring_runners = evaluated_offspring_state.runners  # get batched OneRunnerState
 
     # 4) Combine parents and offspring
@@ -590,7 +747,12 @@ def _runners_crossover_selection(runners: RunnersState, conf: ESConfig) -> Tuple
         lambda a, b: a + b,
         jax.tree_util.tree_map(
             _mean_param_l2_diff,
-            jax.tree_map(lambda x: x[:num_offspring], runners.runners.params),
+            # jax.tree_map(lambda x: x[:num_offspring], runners.runners.params),
+            jax.tree_map(
+                lambda x: jnp.take(x, template_parent_idx, axis=0)
+                if hasattr(x, "ndim") and x.ndim > 0 else x,
+                runners.runners.params,
+            ),
             offspring_params
         )
     )
@@ -620,7 +782,30 @@ def _runners_crossover_selection(runners: RunnersState, conf: ESConfig) -> Tuple
         "offspring_entropy_other_mean": offspring_entropy_other_mean,
     }
 
-    return runners.replace(runners=new_runners, key=new_master_key), metrics
+    # Distributional metrics (for logging histograms)
+    parents_fitness_distribution = runners.runners.fitness.reshape(-1)
+    # offspring fitness per-runner (evaluated_offspring_runners holds fitness per offspring)
+    offspring_fitness_distribution = evaluated_offspring_runners.fitness.reshape(-1)
+    sample_offspring_fitness_distribution = offspring_metrics.get("sample_fitness_distribution", jnp.array([], dtype=jnp.float32))
+    sample_offspring_eval_fitness_distribution = offspring_metrics.get("sample_eval_fitness_distribution", jnp.array([], dtype=jnp.float32))
+
+    distributional_metrics = {
+        "parents_fitness_distribution": parents_fitness_distribution,
+        "offspring_fitness_distribution": offspring_fitness_distribution,
+        "sample_offspring_fitness_distribution": sample_offspring_fitness_distribution,
+        "sample_offspring_eval_fitness_distribution": sample_offspring_eval_fitness_distribution,
+    }
+
+    # population params distribution (flatten all params from the newly selected population)
+    try:
+        new_population_params_leaves = jax.tree_util.tree_leaves(new_runners.params)
+        population_params_distribution = jnp.concatenate([x.ravel() for x in new_population_params_leaves])
+    except Exception:
+        population_params_distribution = jnp.array([], dtype=jnp.float32)
+
+    distributional_metrics["population_params_distribution"] = population_params_distribution
+
+    return runners.replace(runners=new_runners, key=new_master_key), metrics, distributional_metrics
 
 def main(conf):
     conf = OmegaConf.merge({
@@ -643,12 +828,15 @@ def main(conf):
         "network_conf": {},
 
         # ES hyperparameter (see ESConfig)
-        "es_conf": {}
+        "es_conf": {},
+
+        #DEBUG
+        "cr_only": True
     }, conf)
     # Naming
     conf = OmegaConf.merge({
-        "project_name": f"toy-DC-SNN-{conf.task}",
-        "run_name":     f"toy-DC-noCR {conf.seed} {conf.network_type} {time.strftime('%H:%M %m-%d')}"
+        "project_name": f"toy-DC-SNN-{conf.task}-1",
+        "run_name":     f"toy-DC-noEC- {conf.seed} {conf.network_type} {time.strftime('%H:%M %m-%d')}"
     }, conf)
     # ES Config
     es_conf = ESConfig(**conf.es_conf)
@@ -690,6 +878,7 @@ def main(conf):
     runners = _runners_init(key_run, key_network_init, es_conf)
     # save model path
     conf.save_model_path = "models/{}/{}/".format(conf.project_name, conf.run_name)
+    conf.run_name = f'noise+{es_conf.crossover_method}-cr{getattr(es_conf, "crossover_ratio", 1.0)}-' + conf.run_name
 
     # wandb
     if "log_group" in conf:
@@ -701,18 +890,19 @@ def main(conf):
     # run
     for step in tqdm(range(1, conf.total_generations + 1)):
         # ES Step
-        if step == 1:
+        if (not conf.cr_only) or step == 1:
             runners, metrics = _runners_run(runners, es_conf)
             metrics = jax.device_get(metrics)
-            wandb.log(metrics, step=step)
+            # wandb.log(metrics, step=step)
             print(f"EC Step {step} | Fitness {metrics['fitness']:.2f} | Eval Fitness {metrics['eval_fitness']:.2f} | Sparsity {metrics['sparsity']:.4f}"
                 f" | p_target_mean {metrics['p_target_mean']:.4f} | p_other_mean {metrics['p_other_mean']:.4f} | "
                 f"entropy_target_mean {metrics['entropy_target_mean']:.4f} | entropy_other_mean {metrics['entropy_other_mean']:.4f}")
 
         # Crossover & Selection
 
-        runners, crossover_metrics = _runners_crossover_selection(runners, es_conf)
+        runners, crossover_metrics, distributional_metrics = _runners_crossover_selection(runners, es_conf)
         crossover_metrics = jax.device_get(crossover_metrics)
+        distributional_metrics = jax.device_get(distributional_metrics)
         wandb.log(crossover_metrics, step=step)
         print(f"CR Step {step} | Mean Parent Fitness {crossover_metrics['mean_parent_fitness']:.2f} | "
               f"Mean Offspring Fitness (Train) {crossover_metrics['mean_offspring_train_fitness']:.2f} | "
@@ -727,7 +917,29 @@ def main(conf):
               f"Offspring p_other_mean {crossover_metrics['offspring_p_other_mean']:.4f} | "
               f"Offspring entropy_target_mean {crossover_metrics['offspring_entropy_target_mean']:.4f} |"
             f" Offspring entropy_other_mean {crossover_metrics['offspring_entropy_other_mean']:.4f}")
-        
+
+        metrics['fitness'] = crossover_metrics['mean_offspring_train_fitness']
+        metrics['eval_fitness'] = crossover_metrics['mean_offspring_eval_fitness']
+        metrics['sparsity'] = crossover_metrics['mean_sparsity']
+        metrics['p_target_mean'] = crossover_metrics['offspring_p_target_mean']
+        metrics['p_other_mean'] = crossover_metrics['offspring_p_other_mean']
+        metrics['entropy_target_mean'] = crossover_metrics['offspring_entropy_target_mean']
+        metrics['entropy_other_mean'] = crossover_metrics['offspring_entropy_other_mean']
+        wandb.log(metrics, step=step)
+
+        # Log distributional histograms to wandb (if available)
+        try:
+            wandb.log({
+                "distribution_sample_offspring_fitness": wandb.Histogram(distributional_metrics['sample_offspring_fitness_distribution']),
+                "distribution_sample_eval_offspring_fitness": wandb.Histogram(distributional_metrics['sample_offspring_eval_fitness_distribution']),
+                "distribution_parents_fitness": wandb.Histogram(distributional_metrics['parents_fitness_distribution']),
+                "distribution_offspring_fitness": wandb.Histogram(distributional_metrics['offspring_fitness_distribution']),
+                "distribution_population_params": wandb.Histogram(distributional_metrics.get('population_params_distribution', [])),
+            }, step=step)
+        except Exception:
+            # if wandb or histograms aren't available in disabled mode, skip
+            pass
+       
         if not (step % conf.save_every):
             fn = conf.save_model_path + str(step)
             save_obj_to_file(fn, dict(
