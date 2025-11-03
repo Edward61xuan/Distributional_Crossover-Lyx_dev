@@ -577,7 +577,7 @@ def main(conf):
     if "log_group" in conf:
         wandb.init(reinit=True, project=f"(G) E-SNN-{conf.task}", group=conf.log_group, name=str(conf.seed), config=OmegaConf.to_container(conf))
     else:
-        wandb.init(reinit=True, project=conf.project_name, name=conf.run_name, config=OmegaConf.to_container(conf), mode="disabled")
+        wandb.init(reinit=True, project=conf.project_name, name=conf.run_name, config=OmegaConf.to_container(conf))
     for step in tqdm(range(1, conf.total_generations + 1)):
         if (not conf.cr_only) and step % 10 == 1:
             runners, metrics = _runners_run(runners, es_conf)
